@@ -1,0 +1,9 @@
+{
+  "name": "checkin-rhythm",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "encoding:check": "node ./scripts/check-encoding.mjs",
+    "encoding:repair": "pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/repair-encoding.ps1"
+  }
+}
