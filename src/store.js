@@ -13,6 +13,12 @@ import {
 const STORAGE_KEY = "checkin_app_data_v1";
 const APP_VERSION = "1.0.0";
 
+const CROSS_PORT_COOKIE_PREFIX = "checkin_sync_v1_";
+const CROSS_PORT_COOKIE_META_KEY = `${CROSS_PORT_COOKIE_PREFIX}meta`;
+const COOKIE_CHUNK_SIZE = 3500;
+const COOKIE_MAX_CHUNKS = 24;
+const COOKIE_TTL_DAYS = 3650;
+
 export const CATEGORY_OPTIONS = [
   { value: "study", label: "学习" },
   { value: "exercise", label: "运动" },
@@ -155,8 +161,130 @@ function validateTaskPayload(payload) {
   };
 }
 
+function hasDocumentCookieSupport() {
+  return typeof document !== "undefined" && typeof document.cookie === "string";
+}
+
+function readCookie(name) {
+  if (!hasDocumentCookieSupport()) {
+    return null;
+  }
+
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = document.cookie.match(new RegExp(`(?:^|; )${escaped}=([^;]*)`));
+  return match ? match[1] : null;
+}
+
+function setCookie(name, value, days = COOKIE_TTL_DAYS) {
+  if (!hasDocumentCookieSupport()) {
+    return;
+  }
+  const maxAge = Math.max(0, Math.floor(days * 24 * 60 * 60));
+  document.cookie = `${name}=${value}; path=/; max-age=${maxAge}; samesite=lax`;
+}
+
+function deleteCookie(name) {
+  if (!hasDocumentCookieSupport()) {
+    return;
+  }
+  document.cookie = `${name}=; path=/; max-age=0; samesite=lax`;
+}
+
+function clearCrossPortCookieBackup() {
+  deleteCookie(CROSS_PORT_COOKIE_META_KEY);
+  for (let index = 0; index < COOKIE_MAX_CHUNKS; index += 1) {
+    deleteCookie(`${CROSS_PORT_COOKIE_PREFIX}${index}`);
+  }
+}
+
+function writeCrossPortCookieBackup(payload) {
+  if (!hasDocumentCookieSupport()) {
+    return;
+  }
+
+  let encoded;
+  try {
+    encoded = encodeURIComponent(JSON.stringify(payload));
+  } catch {
+    return;
+  }
+
+  const chunks = [];
+  for (let i = 0; i < encoded.length; i += COOKIE_CHUNK_SIZE) {
+    chunks.push(encoded.slice(i, i + COOKIE_CHUNK_SIZE));
+  }
+
+  if (chunks.length > COOKIE_MAX_CHUNKS) {
+    console.warn("跨端口备份空间不足，已跳过 cookie 备份");
+    clearCrossPortCookieBackup();
+    return;
+  }
+
+  clearCrossPortCookieBackup();
+
+  chunks.forEach((chunk, index) => {
+    setCookie(`${CROSS_PORT_COOKIE_PREFIX}${index}`, chunk);
+  });
+
+  const meta = {
+    v: 1,
+    chunks: chunks.length,
+    updatedAt: Date.now()
+  };
+  setCookie(CROSS_PORT_COOKIE_META_KEY, encodeURIComponent(JSON.stringify(meta)));
+}
+
+function readCrossPortCookieBackup() {
+  if (!hasDocumentCookieSupport()) {
+    return null;
+  }
+
+  const rawMeta = readCookie(CROSS_PORT_COOKIE_META_KEY);
+  if (!rawMeta) {
+    return null;
+  }
+
+  try {
+    const meta = JSON.parse(decodeURIComponent(rawMeta));
+    const count = Number(meta?.chunks || 0);
+    if (!Number.isInteger(count) || count <= 0 || count > COOKIE_MAX_CHUNKS) {
+      return null;
+    }
+
+    let encoded = "";
+    for (let i = 0; i < count; i += 1) {
+      const chunk = readCookie(`${CROSS_PORT_COOKIE_PREFIX}${i}`);
+      if (!chunk) {
+        return null;
+      }
+      encoded += chunk;
+    }
+
+    return JSON.parse(decodeURIComponent(encoded));
+  } catch {
+    return null;
+  }
+}
+
+function buildDatabaseFromParsed(parsed) {
+  const tasks = Array.isArray(parsed.tasks) ? parsed.tasks.map(normalizeTask) : [];
+  const taskIds = new Set(tasks.map((task) => task.id));
+  const checkin_records = Array.isArray(parsed.checkin_records)
+    ? parsed.checkin_records
+        .map(normalizeRecord)
+        .filter((record) => taskIds.has(record.taskId))
+    : [];
+
+  return {
+    tasks,
+    checkin_records,
+    app_meta: baseMeta(parsed.app_meta)
+  };
+}
+
 function serialize() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
+  writeCrossPortCookieBackup(db);
 }
 
 function notify() {
@@ -173,39 +301,34 @@ function applyAndSync(mutator) {
 
 function loadDatabase() {
   const raw = localStorage.getItem(STORAGE_KEY);
-  if (!raw) {
-    return {
-      tasks: [],
-      checkin_records: [],
-      app_meta: baseMeta()
-    };
+  if (raw) {
+    try {
+      return buildDatabaseFromParsed(JSON.parse(raw));
+    } catch {
+      // ignore invalid local payload, try cross-port backup next
+    }
   }
 
-  try {
-    const parsed = JSON.parse(raw);
-    const tasks = Array.isArray(parsed.tasks) ? parsed.tasks.map(normalizeTask) : [];
-    const taskIds = new Set(tasks.map((task) => task.id));
-    const checkin_records = Array.isArray(parsed.checkin_records)
-      ? parsed.checkin_records
-          .map(normalizeRecord)
-          .filter((record) => taskIds.has(record.taskId))
-      : [];
-
-    return {
-      tasks,
-      checkin_records,
-      app_meta: baseMeta(parsed.app_meta)
-    };
-  } catch {
-    return {
-      tasks: [],
-      checkin_records: [],
-      app_meta: baseMeta()
-    };
+  const cookiePayload = readCrossPortCookieBackup();
+  if (cookiePayload) {
+    try {
+      const restored = buildDatabaseFromParsed(cookiePayload);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(restored));
+      return restored;
+    } catch {
+      // ignore invalid cookie payload and continue to empty db
+    }
   }
+
+  return {
+    tasks: [],
+    checkin_records: [],
+    app_meta: baseMeta()
+  };
 }
 
 function findTask(taskId) {
+
   return db.tasks.find((task) => task.id === taskId) || null;
 }
 
